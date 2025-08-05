@@ -78,6 +78,9 @@ const char* GUAC_RDP_CLIENT_ARGS[] = {
     "console-audio",
     "server-layout",
     "security",
+    "auth-pkg",
+    "kdc-url",
+    "kerberos-cache",
     "ignore-cert",
     "cert-tofu",
     "cert-fingerprints",
@@ -295,6 +298,28 @@ enum RDP_ARGS_IDX {
      * mode is negotiated ("any").
      */
     IDX_SECURITY,
+
+    /**
+     * The authentication package to use based on the underlying FreeRDP support
+     * for alternatives to NTML. Currently FreeRDP2 only supports NTLM, while
+     * FreeRDP3 introduces support for Kerberos and continues to support NTLM.
+     * The default is to negotiate between guacd and the remote server.
+     */
+    IDX_AUTH_PKG,
+
+    /**
+     * When kerberos authentication is in use, the URL of the KDC server to use
+     * for ticket validation. If not specified, guacd will use the underlying
+     * system's kerberos configuration.
+     */
+    IDX_KDC_URL,
+
+    /**
+     * When kerberos authentication is in use, the path to the kerberos ticket
+     * cache, relative to GUACAMOLE_HOME. If not specified, the default system
+     * cache of the underlying system on which guacd is running will be used.
+     */
+    IDX_KERBEROS_CACHE,
 
     /**
      * "true" if validity of the RDP server's certificate should be ignored,
@@ -832,6 +857,30 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
         settings->security_mode = GUAC_SECURITY_ANY;
     }
 
+    /* Use kerberos authentication */
+    if (strcmp(argv[IDX_AUTH_PKG], "kerberos") == 0) {
+        guac_user_log(user, GUAC_LOG_INFO, "Authentication package: Kerberos");
+        settings->auth_pkg = GUAC_AUTH_PKG_KERBEROS;
+    }
+
+    else if (strcmp(argv[IDX_AUTH_PKG], "ntlm") == 0) {
+        guac_user_log(user, GUAC_LOG_INFO, "Authentication package: NTLM");
+        settings->auth_pkg = GUAC_AUTH_PKG_NTLM;
+    }
+
+    else {
+        guac_user_log(user, GUAC_LOG_INFO, "No authentication package requested, defaulting to negotiate.");
+        settings->auth_pkg = GUAC_AUTH_PKG_ANY;
+    }
+
+    /* Set KDC URL */
+    settings->kdc_url = guac_user_parse_args_string(user, GUAC_RDP_CLIENT_ARGS,
+            argv, IDX_KDC_URL, NULL);
+
+    /* Set Kerberos cache */
+    settings->kerberos_cache = guac_user_parse_args_string(user,
+            GUAC_RDP_CLIENT_ARGS, argv, IDX_KERBEROS_CACHE, NULL);
+
     /* Set hostname */
     settings->hostname =
         guac_user_parse_args_string(user, GUAC_RDP_CLIENT_ARGS, argv,
@@ -1298,14 +1347,14 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
     /* Use default clipboard buffer size if given one is invalid. */
     if (settings->clipboard_buffer_size < GUAC_COMMON_CLIPBOARD_MIN_LENGTH) {
         settings->clipboard_buffer_size = GUAC_COMMON_CLIPBOARD_MIN_LENGTH;
-        guac_user_log(user, GUAC_LOG_INFO, "Unspecified or invalid clipboard buffer "
+        guac_user_log(user, GUAC_LOG_ERROR, "Invalid clipboard buffer "
                 "size: \"%s\". Using the default minimum size: %i.",
                 argv[IDX_CLIPBOARD_BUFFER_SIZE],
                 settings->clipboard_buffer_size);
     }
     else if (settings->clipboard_buffer_size > GUAC_COMMON_CLIPBOARD_MAX_LENGTH) {
         settings->clipboard_buffer_size = GUAC_COMMON_CLIPBOARD_MAX_LENGTH;
-        guac_user_log(user, GUAC_LOG_WARNING, "Invalid clipboard buffer "
+        guac_user_log(user, GUAC_LOG_ERROR, "Invalid clipboard buffer "
                 "size: \"%s\". Using the default maximum size: %i.",
                 argv[IDX_CLIPBOARD_BUFFER_SIZE],
                 settings->clipboard_buffer_size);
@@ -1358,8 +1407,8 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
         
         /* If WoL has been requested but no MAC address given, log a warning. */
         if(strcmp(argv[IDX_WOL_MAC_ADDR], "") == 0) {
-            guac_user_log(user, GUAC_LOG_WARNING, "WoL was enabled, but no "
-                    "MAC address was provided. WoL will not be sent.");
+            guac_user_log(user, GUAC_LOG_WARNING, "WoL requested but no MAC ",
+                    "address specified.  WoL will not be sent.");
             settings->wol_send_packet = 0;
         }
         
@@ -1410,6 +1459,8 @@ void guac_rdp_settings_free(guac_rdp_settings* settings) {
     guac_mem_free(settings->timezone);
     guac_mem_free(settings->username);
     guac_mem_free(settings->printer_name);
+    guac_mem_free(settings->kdc_url);
+    guac_mem_free(settings->kerberos_cache);
 
     /* Free channel name array */
     if (settings->svc_names != NULL) {
@@ -1562,9 +1613,6 @@ void guac_rdp_push_settings(guac_client* client,
     freerdp_settings_set_bool(rdp_settings, FreeRDP_FrameMarkerCommandEnabled, TRUE);
     freerdp_settings_set_bool(rdp_settings, FreeRDP_SurfaceFrameMarkerEnabled, TRUE);
 
-    freerdp_settings_set_bool(rdp_settings, FreeRDP_FastPathInput, TRUE);
-    freerdp_settings_set_bool(rdp_settings, FreeRDP_FastPathOutput, TRUE);
-
     /* Enable RemoteFX / Graphics Pipeline */
     if (guac_settings->enable_gfx) {
 
@@ -1578,6 +1626,7 @@ void guac_rdp_push_settings(guac_client* client,
         }
 
         /* Required for RemoteFX / Graphics Pipeline */
+        freerdp_settings_set_bool(rdp_settings, FreeRDP_FastPathOutput, TRUE);
         freerdp_settings_set_uint32(rdp_settings, FreeRDP_ColorDepth, RDP_GFX_REQUIRED_DEPTH);
         freerdp_settings_set_bool(rdp_settings, FreeRDP_SoftwareGdi, TRUE);
 
@@ -1697,6 +1746,29 @@ void guac_rdp_push_settings(guac_client* client,
 
     }
 
+    /* Set the authentication package to use. */
+    switch(guac_settings->auth_pkg) {
+
+        case GUAC_AUTH_PKG_NTLM:
+            freerdp_settings_set_string(rdp_settings, FreeRDP_AuthenticationPackageList, "ntlm,!kerberos");
+            break;
+
+        case GUAC_AUTH_PKG_KERBEROS:
+            freerdp_settings_set_string(rdp_settings, FreeRDP_AuthenticationPackageList, "!ntlm,kerberos");
+            break;
+
+        case GUAC_AUTH_PKG_ANY:
+            freerdp_settings_set_string(rdp_settings, FreeRDP_AuthenticationPackageList, "ntlm,kerberos");
+            break;
+
+    }
+
+    if (guac_settings->kdc_url != NULL)
+        freerdp_settings_set_string(rdp_settings, FreeRDP_KerberosKdcUrl, guac_strdup(guac_settings->kdc_url));
+
+    if (guac_settings->kerberos_cache != NULL)
+        freerdp_settings_set_string(rdp_settings, FreeRDP_KerberosCache, guac_strdup(guac_settings->kerberos_cache));
+
     /* Security */
     freerdp_settings_set_bool(rdp_settings, FreeRDP_Authentication, !guac_settings->disable_authentication);
     freerdp_settings_set_bool(rdp_settings, FreeRDP_IgnoreCertificate, guac_settings->ignore_certificate);
@@ -1762,6 +1834,19 @@ void guac_rdp_push_settings(guac_client* client,
     freerdp_settings_set_uint32(rdp_settings, FreeRDP_OsMinorType, OSMINORTYPE_UNSPECIFIED);
     freerdp_settings_set_bool(rdp_settings, FreeRDP_DesktopResize, TRUE);
 
+    /* Claim support only for specific updates, independent of FreeRDP defaults */
+	BYTE* order_support = freerdp_settings_get_pointer_writable(rdp_settings, FreeRDP_OrderSupport);
+	if (order_support) {
+        ZeroMemory(order_support, GUAC_RDP_ORDER_SUPPORT_LENGTH);
+        order_support[NEG_DSTBLT_INDEX] = TRUE;
+        order_support[NEG_SCRBLT_INDEX] = TRUE;
+        order_support[NEG_MEMBLT_INDEX] = !guac_settings->disable_bitmap_caching;
+        order_support[NEG_MEMBLT_V2_INDEX] = !guac_settings->disable_bitmap_caching;
+        order_support[NEG_GLYPH_INDEX_INDEX] = !guac_settings->disable_glyph_caching;
+        order_support[NEG_FAST_INDEX_INDEX] = !guac_settings->disable_glyph_caching;
+        order_support[NEG_FAST_GLYPH_INDEX] = !guac_settings->disable_glyph_caching;
+    }
+
 #ifdef HAVE_RDPSETTINGS_ALLOWUNANOUNCEDORDERSFROMSERVER
     /* Do not consider server use of unannounced orders to be a fatal error */
     freerdp_settings_set_bool(rdp_settings, FreeRDP_AllowUnanouncedOrdersFromServer, TRUE);
@@ -1796,8 +1881,9 @@ void guac_rdp_push_settings(guac_client* client,
     rdp_settings->FrameMarkerCommandEnabled = TRUE;
     rdp_settings->SurfaceFrameMarkerEnabled = TRUE;
 
-    rdp_settings->FastPathInput = TRUE;
-    rdp_settings->FastPathOutput = TRUE;
+    /* Always handle input events asynchronously (rather than synchronously
+     * with the rest of FreeRDP's event loop, including graphics) */
+    rdp_settings->AsyncInput = TRUE;
 
     /* Enable RemoteFX / Graphics Pipeline */
     if (guac_settings->enable_gfx) {
@@ -1812,6 +1898,7 @@ void guac_rdp_push_settings(guac_client* client,
         }
 
         /* Required for RemoteFX / Graphics Pipeline */
+        rdp_settings->FastPathOutput = TRUE;
         rdp_settings->ColorDepth = RDP_GFX_REQUIRED_DEPTH;
         rdp_settings->SoftwareGdi = TRUE;
 
@@ -1934,6 +2021,29 @@ void guac_rdp_push_settings(guac_client* client,
 
     }
 
+    /* Set the authentication package preferences */
+    switch(guac_settings->auth_pkg) {
+        
+        case GUAC_AUTH_PKG_NTLM:
+            rdp_settings->AuthenticationPackageList = "ntlm,!kerberos";
+            break;
+        
+        case GUAC_AUTH_PKG_KERBEROS:
+            rdp_settings->AuthenticationPackageList = "!ntlm,kerberos";
+            break;
+
+        case GUAC_AUTH_PKG_ANY:
+            rdp_settings->AuthenticationPackageList = "ntlm,kerberos";
+            break;
+
+    }
+
+    /* Kerberos KDC URL */
+    rdp_settings->KerberosKdcUrl = guac_strdup(guac_settings->kdc_url);
+
+    /* Kerberos ticket cache */
+    rdp_settings->KerberosCache = guac_strdup(guac_settings->kerberos_cache);
+
     /* Security */
     rdp_settings->Authentication = !guac_settings->disable_authentication;
     rdp_settings->IgnoreCertificate = guac_settings->ignore_certificate;
@@ -1995,6 +2105,16 @@ void guac_rdp_push_settings(guac_client* client,
     rdp_settings->OsMajorType = OSMAJORTYPE_UNSPECIFIED;
     rdp_settings->OsMinorType = OSMINORTYPE_UNSPECIFIED;
     rdp_settings->DesktopResize = TRUE;
+
+    /* Claim support only for specific updates, independent of FreeRDP defaults */
+    ZeroMemory(rdp_settings->OrderSupport, GUAC_RDP_ORDER_SUPPORT_LENGTH);
+    rdp_settings->OrderSupport[NEG_DSTBLT_INDEX] = TRUE;
+    rdp_settings->OrderSupport[NEG_SCRBLT_INDEX] = TRUE;
+    rdp_settings->OrderSupport[NEG_MEMBLT_INDEX] = !guac_settings->disable_bitmap_caching;
+    rdp_settings->OrderSupport[NEG_MEMBLT_V2_INDEX] = !guac_settings->disable_bitmap_caching;
+    rdp_settings->OrderSupport[NEG_GLYPH_INDEX_INDEX] = !guac_settings->disable_glyph_caching;
+    rdp_settings->OrderSupport[NEG_FAST_INDEX_INDEX] = !guac_settings->disable_glyph_caching;
+    rdp_settings->OrderSupport[NEG_FAST_GLYPH_INDEX] = !guac_settings->disable_glyph_caching;
 
 #ifdef HAVE_RDPSETTINGS_ALLOWUNANOUNCEDORDERSFROMSERVER
     /* Do not consider server use of unannounced orders to be a fatal error */
